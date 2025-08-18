@@ -69,3 +69,9 @@ $result | Format-Table
 
 # Example: filter only Basic SKUs
 # $result | Where-Object { $_.PublicIPSKU -eq "Basic" }
+
+# Output table to screen
+$result | Format-Table
+
+# Export to CSV
+$result | Export-Csv -Path .\AppGateway_IPs.csv -NoTypeInformation -Encoding UTF8
