@@ -17,19 +17,25 @@ $results = foreach ($ip in $basicIps) {
 
     $associationType = if (-not $associatedResourceId) { 'Unassociated' }
         elseif ($associatedResourceId -match '/networkInterfaces/')       { 'NetworkInterface' }
-        elseif ($associatedResourceId -match '/loadBalancers/')          { 'LoadBalancer' }
-        elseif ($associatedResourceId -match '/applicationGateways/')    { 'ApplicationGateway' }
-        elseif ($associatedResourceId -match '/virtualNetworkGateways/') { 'VpnGateway' }
-        elseif ($associatedResourceId -match '/bastionHosts/')           { 'Bastion' }
-        elseif ($associatedResourceId -match '/firewalls/')              { 'AzureFirewall' }
-        elseif ($associatedResourceId -match '/natGateways/')            { 'NatGateway' }
+        elseif ($associatedResourceId -match '/loadBalancers/')           { 'LoadBalancer' }
+        elseif ($associatedResourceId -match '/applicationGateways/')     { 'ApplicationGateway' }
+        elseif ($associatedResourceId -match '/virtualNetworkGateways/')  { 'VpnGateway' }
+        elseif ($associatedResourceId -match '/bastionHosts/')            { 'Bastion' }
+        elseif ($associatedResourceId -match '/firewalls/')               { 'AzureFirewall' }
+        elseif ($associatedResourceId -match '/natGateways/')             { 'NatGateway' }
         else { 'Other' }
+
+    # Normalize IP + add FQDN for visibility
+    $ipAddr = $ip.properties.ipAddress
+    if ([string]::IsNullOrWhiteSpace($ipAddr)) { $ipAddr = '<unallocated>' }
+    $fqdn = $ip.properties.dnsSettings.fqdn
 
     [pscustomobject]@{
         SubscriptionId      = (az account show --query id -o tsv)
         ResourceGroup       = $ip.resourceGroup
         Name                = $ip.name
-        IpAddress           = $ip.properties.ipAddress
+        IpAddress           = $ipAddr
+        FQDN                = $fqdn
         Sku                 = $ip.sku.name
         AllocationMethod    = $ip.properties.publicIPAllocationMethod
         IpVersion           = $ip.properties.publicIPAddressVersion
@@ -40,8 +46,11 @@ $results = foreach ($ip in $basicIps) {
     }
 }
 
-# Work with it locally
-$results | Format-Table -AutoSize
+# Show as a wide list so IPs never get hidden
+$results | Select-Object ResourceGroup,Name,IpAddress,FQDN,Sku,AllocationMethod,AssociationType | Format-List
 
-# Save to CSV for reference
+# If you want JUST the IP strings (one per line), do this:
+$results | ForEach-Object { $_.IpAddress }
+
+# Save to CSV (includes the new FQDN column and normalized IpAddress)
 $results | Export-Csv -NoTypeInformation -Encoding UTF8 BasicPublicIPs.csv

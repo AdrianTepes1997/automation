@@ -1,4 +1,4 @@
-# DRAFT
+# working
 # variables list
 #$rgname = ""
 $subid = ""
@@ -6,13 +6,23 @@ $subid = ""
 az login
 az account set --subscription $subid
 
-# 1. Grab all Application Gateways in the subscription in one shot
-$agws = az network application-gateway list -o json | ConvertFrom-Json
+# az login
+# az account set --subscription "<SUBSCRIPTION_ID_OR_NAME>"
 
-# 2. Build a result set locally
+# 1) Pull resources once
+$agws = az network application-gateway list -o json | ConvertFrom-Json
+$pips = az network public-ip list -o json | ConvertFrom-Json
+
+# 2) Index Public IPs by their full resource ID (case-insensitive)
+$pipById = @{}
+foreach ($pip in $pips) {
+    $pipById[$pip.id.ToLower()] = $pip
+}
+
+# 3) Build results locally
 $result = foreach ($ag in $agws) {
-    $fips = $ag.frontendIPConfigurations
-    $agSku = $ag.sku.name
+    $fips  = $ag.properties.frontendIPConfigurations
+    $agSku = $ag.properties.sku.name
 
     if (-not $fips) {
         [pscustomobject]@{
@@ -32,18 +42,16 @@ $result = foreach ($ag in $agws) {
     foreach ($fip in $fips) {
         $pipId = $fip.properties.publicIPAddress.id
         if ($pipId) {
-            # Lookup the Public IP once, still local
-            $pip = az network public-ip show --ids $pipId -o json | ConvertFrom-Json
-
+            $pip = $pipById[$pipId.ToLower()]
             [pscustomobject]@{
                 ApplicationGateway = $ag.name
                 ResourceGroup      = $ag.resourceGroup
                 FrontendIPConfig   = $fip.name
                 PublicIPName       = $pip.name
-                PublicIPAddress    = $pip.ipAddress
+                PublicIPAddress    = $pip.properties.ipAddress
                 PublicIPSKU        = $pip.sku.name
                 PublicIPTier       = $pip.sku.tier
-                AllocationMethod   = $pip.publicIPAllocationMethod
+                AllocationMethod   = $pip.properties.publicIPAllocationMethod
                 AgwSkuName         = $agSku
             }
         }
@@ -63,15 +71,11 @@ $result = foreach ($ag in $agws) {
     }
 }
 
-# 3. Now $result has everything locally — parse/filter as needed
-# Table view
-$result | Format-Table
+# 4) Display + CSV
+$result | Sort-Object ResourceGroup, ApplicationGateway, FrontendIPConfig | Format-Table
 
-# Example: filter only Basic SKUs
-# $result | Where-Object { $_.PublicIPSKU -eq "Basic" }
-
-# Output table to screen
-$result | Format-Table
-
-# Export to CSV
-$result | Export-Csv -Path .\AppGateway_IPs.csv -NoTypeInformation -Encoding UTF8
+# Timestamped CSV to avoid overwrites
+$ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$outFile = ".\AppGateway_IPs_$ts.csv"
+$result | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
+Write-Host "Saved: $outFile"
