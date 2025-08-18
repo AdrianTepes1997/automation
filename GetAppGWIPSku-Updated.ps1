@@ -132,3 +132,6 @@ $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $outFile = ".\AppGateway_IPs_$ts.csv"
 $result | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
 Write-Host "Saved: $outFile"
+
+$pipId = "<put the public IP resource ID here>"
+az network public-ip show --ids $pipId --query "properties.{ip:ipAddress, alloc:publicIPAllocationMethod, sku:sku.name, tier:sku.tier, prefix:publicIPPrefix.id}" -o table
