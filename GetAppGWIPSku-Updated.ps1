@@ -14,11 +14,27 @@ function Coalesce {
     return $default
 }
 
+# Parse resource group and name from a resource ID
+function Parse-PipId {
+    param([string]$id)
+    # /subscriptions/.../resourceGroups/<rg>/providers/Microsoft.Network/publicIPAddresses/<name>
+    $rg   = $null
+    $name = $null
+    if ($id) {
+        $parts = $id.Trim('/').Split('/')
+        for ($i=0; $i -lt $parts.Length; $i++) {
+            if ($parts[$i] -eq 'resourceGroups' -and ($i + 1) -lt $parts.Length) { $rg = $parts[$i+1] }
+            if ($parts[$i] -eq 'publicIPAddresses' -and ($i + 1) -lt $parts.Length) { $name = $parts[$i+1] }
+        }
+    }
+    [pscustomobject]@{ ResourceGroup = $rg; Name = $name }
+}
+
 # 1) Pull once
 $agws = az network application-gateway list -o json | ConvertFrom-Json
 $pips = az network public-ip list -o json | ConvertFrom-Json
 
-# 2) Index PIPs by ID
+# 2) Index Public IPs by ID
 $pipById = @{}
 foreach ($pip in $pips) {
     if ($pip -and $pip.id) { $pipById[$pip.id.ToLower()] = $pip }
@@ -58,26 +74,42 @@ $result = foreach ($ag in $agws) {
         # Primary source
         $ipAddr  = if ($pip) { $pip.properties.ipAddress } else { "-" }
 
-        # If still blank, check for prefix or do a one-off fresh read
+        # Fallback A: prefix-backed (no concrete IP yet)
         if (-not $ipAddr -or $ipAddr -eq "") {
             $prefixId = if ($pip) { $pip.properties.publicIPPrefix.id } else { $null }
             if ($prefixId) {
-                # From a Public IP Prefix but not yet allocated to a concrete address
                 $ipAddr = "[From Prefix: $(Split-Path $prefixId -Leaf)]"
             }
-            elseif ($pipId) {
-                # One-off refresh for this IP (sometimes list payload is stale)
+        }
+
+        # Fallback B: force-refresh via --ids
+        if (-not $ipAddr -or $ipAddr -eq "") {
+            if ($pipId) {
                 try {
                     $fresh = az network public-ip show --ids $pipId -o json | ConvertFrom-Json
-                    $ipAddr = Coalesce @($fresh.properties.ipAddress, $ipAddr, "Unallocated")
-                } catch {
-                    if (-not $ipAddr -or $ipAddr -eq "") { $ipAddr = "Unallocated" }
-                }
-            }
-            else {
-                if (-not $ipAddr -or $ipAddr -eq "") { $ipAddr = "-" }
+                    $ipAddr = Coalesce @($fresh.properties.ipAddress, $ipAddr)
+                    if (-not $alloc -or $alloc -eq "-") {
+                        $alloc = Coalesce @($fresh.properties.publicIPAllocationMethod, $alloc)
+                    }
+                } catch { }
             }
         }
+
+        # Fallback C: direct by RG+name (works in some tenants where --ids is stale)
+        if (-not $ipAddr -or $ipAddr -eq "") {
+            $parsed = Parse-PipId -id $pipId
+            if ($parsed.ResourceGroup -and $parsed.Name) {
+                try {
+                    $fresh2 = az network public-ip show -g $parsed.ResourceGroup -n $parsed.Name -o json | ConvertFrom-Json
+                    $ipAddr = Coalesce @($fresh2.properties.ipAddress, $ipAddr)
+                    if (-not $alloc -or $alloc -eq "-") {
+                        $alloc = Coalesce @($fresh2.properties.publicIPAllocationMethod, $alloc)
+                    }
+                } catch { }
+            }
+        }
+
+        if (-not $ipAddr -or $ipAddr -eq "") { $ipAddr = "Unallocated" }
 
         [pscustomobject]@{
             ApplicationGateway = $ag.name
@@ -100,7 +132,3 @@ $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
 $outFile = ".\AppGateway_IPs_$ts.csv"
 $result | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
 Write-Host "Saved: $outFile"
-
-# Optional quick checks:
-# Unallocated or prefix-backed rows:
-# $result | Where-Object { $_.PublicIPAddress -like "Unallocated" -or $_.PublicIPAddress -like "[From Prefix:*" } | ft
