@@ -6,6 +6,15 @@ $subid = ""
 az login
 az account set --subscription $subid
 
+# --- Helper: first non-null/non-empty from a list ---
+function Coalesce {
+    param([object[]]$vals, $default = $null)
+    foreach ($v in $vals) {
+        if ($null -ne $v -and $v -ne "") { return $v }
+    }
+    return $default
+}
+
 # --- 1) Pull once ---
 $agws = az network application-gateway list -o json | ConvertFrom-Json
 $pips = az network public-ip list -o json | ConvertFrom-Json
@@ -16,20 +25,15 @@ foreach ($pip in $pips) {
     if ($pip -and $pip.id) { $pipById[$pip.id.ToLower()] = $pip }
 }
 
-# Helper to coalesce JSON paths safely
-function Get-First {
-    param($vals)
-    foreach ($v in $vals) { if ($null -ne $v -and $v -ne "") { return $v } }
-    return $null
-}
-
-# --- 3) Build results locally (robust across shapes) ---
+# --- 3) Build results (PowerShell 5.1 safe) ---
 $result = foreach ($ag in $agws) {
-    $fips = Get-First @(
+
+    $fips  = Coalesce @(
         $ag.properties.frontendIPConfigurations,
         $ag.frontendIPConfigurations
     )
-    $agSku = Get-First @(
+
+    $agSku = Coalesce @(
         $ag.properties.sku.name,
         $ag.sku.name
     )
@@ -50,51 +54,43 @@ $result = foreach ($ag in $agws) {
     }
 
     foreach ($fip in $fips) {
-        # Public IP reference can be in either place depending on CLI/object shape
-        $pipRef = Get-First @(
+
+        $pipRef = Coalesce @(
             $fip.properties.publicIPAddress,
             $fip.publicIPAddress
         )
-        $pipId = $pipRef.id
 
-        if ($pipId) {
-            $pip = $pipById[$pipId.ToLower()]
+        $pipId = if ($pipRef) { $pipRef.id } else { $null }
+        $pip   = if ($pipId) { $pipById[$pipId.ToLower()] } else { $null }
 
-            # If for some reason the ID lookup failed, we still emit a useful row
-            $pipName = Get-First @($pip.name, (Split-Path $pipId -Leaf))
-            $ipAddr  = Get-First @($pip.properties.ipAddress)
-            $skuName = Get-First @($pip.sku.name)
-            $skuTier = Get-First @($pip.sku.tier)
-            $alloc   = Get-First @($pip.properties.publicIPAllocationMethod)
+        # Derive fields safely (don’t touch members on $null)
+        $pipName = if ($pip) { $pip.name } elseif ($pipId) { Split-Path $pipId -Leaf } else { "-" }
+        $ipAddr  = if ($pip) { $pip.properties.ipAddress } else { "-" }
+        $skuName = if ($pip) { $pip.sku.name } else { if ($pipId) { "Unknown" } else { "None (private-only)" } }
+        $skuTier = if ($pip) { $pip.sku.tier } else { "-" }
+        $alloc   = if ($pip) { $pip.properties.publicIPAllocationMethod } else { "-" }
 
-            [pscustomobject]@{
-                ApplicationGateway = $ag.name
-                ResourceGroup      = $ag.resourceGroup
-                FrontendIPConfig   = $fip.name
-                PublicIPName       = $pipName
-                PublicIPAddress    = $ipAddr
-                PublicIPSKU        = ($skuName ? $skuName : "Unknown")
-                PublicIPTier       = ($skuTier ? $skuTier : "-")
-                AllocationMethod   = ($alloc   ? $alloc   : "-")
-                AgwSkuName         = $agSku
-            }
-        }
-        else {
-            # No public IP ref on this frontend (likely private-only frontend bound to a subnet)
-            [pscustomobject]@{
-                ApplicationGateway = $ag.name
-                ResourceGroup      = $ag.resourceGroup
-                FrontendIPConfig   = $fip.name
-                PublicIPName       = "-"
-                PublicIPAddress    = "-"
-                PublicIPSKU        = "None (private-only)"
-                PublicIPTier       = "-"
-                AllocationMethod   = "-"
-                AgwSkuName         = $agSku
-            }
+        [pscustomobject]@{
+            ApplicationGateway = $ag.name
+            ResourceGroup      = $ag.resourceGroup
+            FrontendIPConfig   = $fip.name
+            PublicIPName       = $pipName
+            PublicIPAddress    = $ipAddr
+            PublicIPSKU        = $skuName
+            PublicIPTier       = $skuTier
+            AllocationMethod   = $alloc
+            AgwSkuName         = $agSku
         }
     }
 }
 
 # --- 4) Display + CSV ---
 $result | Sort-Object ResourceGroup, ApplicationGateway, FrontendIPConfig | Format-Table
+
+$ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
+$outFile = ".\AppGateway_IPs_$ts.csv"
+$result | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
+Write-Host "Saved: $outFile"
+
+# Example: rows missing IPs (dynamic/unallocated or private-only)
+# $result | Where-Object { -not $_.PublicIPAddress -or $_.PublicIPAddress -eq "-" } | Format-Table
