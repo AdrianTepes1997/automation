@@ -6,7 +6,7 @@ $subid = ""
 az login
 az account set --subscription $subid
 
-# --- 1) Pull everything once ---
+# --- 1) Pull once ---
 $agws = az network application-gateway list -o json | ConvertFrom-Json
 $pips = az network public-ip list -o json | ConvertFrom-Json
 
@@ -16,21 +16,23 @@ foreach ($pip in $pips) {
     if ($pip -and $pip.id) { $pipById[$pip.id.ToLower()] = $pip }
 }
 
-# --- 3) Build results locally (no more az calls) ---
+# Helper to coalesce JSON paths safely
+function Get-First {
+    param($vals)
+    foreach ($v in $vals) { if ($null -ne $v -and $v -ne "") { return $v } }
+    return $null
+}
+
+# --- 3) Build results locally (robust across shapes) ---
 $result = foreach ($ag in $agws) {
-
-    # Handle CLI flattening differences (some fields appear under .properties in certain versions)
-    $fips  = if ($ag.properties -and $ag.properties.frontendIPConfigurations) { 
-                $ag.properties.frontendIPConfigurations 
-             } else { 
-                $ag.frontendIPConfigurations 
-             }
-
-    $agSku = if ($ag.properties -and $ag.properties.sku) { 
-                $ag.properties.sku.name 
-             } else { 
-                $ag.sku.name 
-             }
+    $fips = Get-First @(
+        $ag.properties.frontendIPConfigurations,
+        $ag.frontendIPConfigurations
+    )
+    $agSku = Get-First @(
+        $ag.properties.sku.name,
+        $ag.sku.name
+    )
 
     if (-not $fips) {
         [pscustomobject]@{
@@ -48,22 +50,37 @@ $result = foreach ($ag in $agws) {
     }
 
     foreach ($fip in $fips) {
-        $pipId = $fip.properties.publicIPAddress.id
+        # Public IP reference can be in either place depending on CLI/object shape
+        $pipRef = Get-First @(
+            $fip.properties.publicIPAddress,
+            $fip.publicIPAddress
+        )
+        $pipId = $pipRef.id
+
         if ($pipId) {
             $pip = $pipById[$pipId.ToLower()]
+
+            # If for some reason the ID lookup failed, we still emit a useful row
+            $pipName = Get-First @($pip.name, (Split-Path $pipId -Leaf))
+            $ipAddr  = Get-First @($pip.properties.ipAddress)
+            $skuName = Get-First @($pip.sku.name)
+            $skuTier = Get-First @($pip.sku.tier)
+            $alloc   = Get-First @($pip.properties.publicIPAllocationMethod)
+
             [pscustomobject]@{
                 ApplicationGateway = $ag.name
                 ResourceGroup      = $ag.resourceGroup
                 FrontendIPConfig   = $fip.name
-                PublicIPName       = $pip.name
-                PublicIPAddress    = $pip.properties.ipAddress
-                PublicIPSKU        = $pip.sku.name
-                PublicIPTier       = $pip.sku.tier
-                AllocationMethod   = $pip.properties.publicIPAllocationMethod
+                PublicIPName       = $pipName
+                PublicIPAddress    = $ipAddr
+                PublicIPSKU        = ($skuName ? $skuName : "Unknown")
+                PublicIPTier       = ($skuTier ? $skuTier : "-")
+                AllocationMethod   = ($alloc   ? $alloc   : "-")
                 AgwSkuName         = $agSku
             }
         }
         else {
+            # No public IP ref on this frontend (likely private-only frontend bound to a subnet)
             [pscustomobject]@{
                 ApplicationGateway = $ag.name
                 ResourceGroup      = $ag.resourceGroup
@@ -81,12 +98,3 @@ $result = foreach ($ag in $agws) {
 
 # --- 4) Display + CSV ---
 $result | Sort-Object ResourceGroup, ApplicationGateway, FrontendIPConfig | Format-Table
-
-# Timestamped CSV (prevents accidental overwrite)
-$ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
-$outFile = ".\AppGateway_IPs_$ts.csv"
-$result | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
-Write-Host "Saved: $outFile"
-
-# Example: find gateways using Basic public IPs (targets to upgrade)
-# $result | Where-Object { $_.PublicIPSKU -eq 'Basic' } | Format-Table
