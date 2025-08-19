@@ -7,15 +7,10 @@ az login
 az account set --subscription $subid
 
 # --- Helpers ---
-function Coalesce {
-    param([object[]]$vals, $default = $null)
-    foreach ($v in $vals) { if ($null -ne $v -and $v -ne "") { return $v } }
-    return $default
-}
+function Coalesce { param([object[]]$vals,$default=$null) foreach($v in $vals){ if($null -ne $v -and $v -ne ""){ return $v } } $default }
 
 function Parse-PipId {
     param([string]$id)
-    # /subscriptions/.../resourceGroups/<rg>/providers/Microsoft.Network/publicIPAddresses/<name>
     $rg=$null; $name=$null
     if ($id) {
         $parts = $id.Trim('/').Split('/')
@@ -33,13 +28,10 @@ $pips = az network public-ip list -o json | ConvertFrom-Json
 
 # --- 2) Index Public IPs by full resource ID (case-insensitive) ---
 $pipById = @{}
-foreach ($pip in $pips) {
-    if ($pip -and $pip.id) { $pipById[$pip.id.ToLower()] = $pip }
-}
+foreach ($pip in $pips) { if ($pip -and $pip.id) { $pipById[$pip.id.ToLower()] = $pip } }
 
-# --- 3) Build results (uses correct properties paths) ---
+# --- 3) Build results ---
 $result = foreach ($ag in $agws) {
-
     $fips  = Coalesce @($ag.properties.frontendIPConfigurations, $ag.frontendIPConfigurations)
     $agSku = Coalesce @($ag.properties.sku.name, $ag.sku.name)
 
@@ -59,56 +51,49 @@ $result = foreach ($ag in $agws) {
     }
 
     foreach ($fip in $fips) {
-        # Public IP ref may be under properties or top-level depending on CLI/object shape
         $pipRef = Coalesce @($fip.properties.publicIPAddress, $fip.publicIPAddress)
         $pipId  = if ($pipRef) { $pipRef.id } else { $null }
         $pip    = if ($pipId) { $pipById[$pipId.ToLower()] } else { $null }
 
+        # Fields with dual-paths to handle flattened vs properties.*
         $pipName = if ($pip) { $pip.name } elseif ($pipId) { Split-Path $pipId -Leaf } else { "-" }
-        $skuName = if ($pip) { $pip.sku.name } else { if ($pipId) { "Unknown" } else { "None (private-only)" } }
-        $skuTier = if ($pip) { $pip.sku.tier } else { "-" }
-        $alloc   = if ($pip) { $pip.properties.publicIPAllocationMethod } else { "-" }
+        $ipAddr  = if ($pip) { Coalesce @($pip.ipAddress, $pip.properties.ipAddress) } else { "-" }
+        $skuName = if ($pip) { Coalesce @($pip.sku.name, $pip.properties.sku.name) } else { if ($pipId) { "Unknown" } else { "None (private-only)" } }
+        $skuTier = if ($pip) { Coalesce @($pip.sku.tier, $pip.properties.sku.tier) } else { "-" }
+        $alloc   = if ($pip) { Coalesce @($pip.publicIPAllocationMethod, $pip.properties.publicIPAllocationMethod) } else { "-" }
+        $prefixId= if ($pip) { Coalesce @($pip.publicIPPrefix.id, $pip.properties.publicIPPrefix.id) } else { $null }
 
-        # Primary: read from list payload (correct path is properties.ipAddress)
-        $ipAddr  = if ($pip) { $pip.properties.ipAddress } else { "-" }
-
-        # Fallback A: if prefix-backed, show prefix name
+        # If IP missing, try quick fallbacks
         if (-not $ipAddr -or $ipAddr -eq "") {
-            $prefixId = if ($pip) { $pip.properties.publicIPPrefix.id } else { $null }
             if ($prefixId) { $ipAddr = "[From Prefix: $(Split-Path $prefixId -Leaf)]" }
         }
-
-        # Fallback B: one-off refresh via --ids (handles occasional stale list payloads)
         if (-not $ipAddr -or $ipAddr -eq "") {
             if ($pipId) {
                 try {
                     $fresh = az network public-ip show --ids $pipId -o json | ConvertFrom-Json
                     if ($fresh) {
-                        if (-not $ipAddr -or $ipAddr -eq "") { $ipAddr = $fresh.properties.ipAddress }
-                        if (-not $alloc  -or $alloc  -eq "-") { $alloc  = $fresh.properties.publicIPAllocationMethod }
-                        if (-not $skuName -or $skuName -eq "Unknown") { $skuName = $fresh.sku.name }
-                        if (-not $skuTier -or $skuTier -eq "-") { $skuTier = $fresh.sku.tier }
+                        $ipAddr = Coalesce @($ipAddr, $fresh.ipAddress, $fresh.properties.ipAddress)
+                        $alloc  = Coalesce @($alloc, $fresh.publicIPAllocationMethod, $fresh.properties.publicIPAllocationMethod, "-")
+                        $skuName= Coalesce @($skuName, $fresh.sku.name)
+                        $skuTier= Coalesce @($skuTier, $fresh.sku.tier)
                     }
                 } catch { }
             }
         }
-
-        # Fallback C: direct by RG+name (some tenants return data here when --ids is stale)
         if (-not $ipAddr -or $ipAddr -eq "") {
             $parsed = Parse-PipId -id $pipId
             if ($parsed.ResourceGroup -and $parsed.Name) {
                 try {
                     $fresh2 = az network public-ip show -g $parsed.ResourceGroup -n $parsed.Name -o json | ConvertFrom-Json
                     if ($fresh2) {
-                        if (-not $ipAddr -or $ipAddr -eq "") { $ipAddr = $fresh2.properties.ipAddress }
-                        if (-not $alloc  -or $alloc  -eq "-") { $alloc  = $fresh2.properties.publicIPAllocationMethod }
-                        if (-not $skuName -or $skuName -eq "Unknown") { $skuName = $fresh2.sku.name }
-                        if (-not $skuTier -or $skuTier -eq "-") { $skuTier = $fresh2.sku.tier }
+                        $ipAddr = Coalesce @($ipAddr, $fresh2.ipAddress, $fresh2.properties.ipAddress, "Unallocated")
+                        $alloc  = Coalesce @($alloc, $fresh2.publicIPAllocationMethod, $fresh2.properties.publicIPAllocationMethod, "-")
+                        $skuName= Coalesce @($skuName, $fresh2.sku.name)
+                        $skuTier= Coalesce @($skuTier, $fresh2.sku.tier)
                     }
                 } catch { }
             }
         }
-
         if (-not $ipAddr -or $ipAddr -eq "") { $ipAddr = "Unallocated" }
 
         [pscustomobject]@{
@@ -116,16 +101,16 @@ $result = foreach ($ag in $agws) {
             ResourceGroup      = $ag.resourceGroup
             FrontendIPConfig   = $fip.name
             PublicIPName       = $pipName
-            PublicIPAddress    = $ipAddr
+            PublicIPAddress    = $ipAddr            # <-- now resolves (flattened or nested)
             PublicIPSKU        = $skuName
             PublicIPTier       = $skuTier
-            AllocationMethod   = $alloc
+            AllocationMethod   = $alloc             # <-- flattened or nested
             AgwSkuName         = $agSku
         }
     }
 }
 
-# --- 4) Display + CSV ---
+# --- 4) Output + CSV ---
 $result | Sort-Object ResourceGroup, ApplicationGateway, FrontendIPConfig | Format-Table
 
 $ts = (Get-Date).ToString("yyyyMMdd-HHmmss")
