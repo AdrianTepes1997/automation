@@ -118,13 +118,6 @@ $outFile = ".\AppGateway_IPs_$ts.csv"
 $result | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
 Write-Host "Saved: $outFile"
 
-# Examples:
-# Only Basic Public IPs (targets to upgrade)
-# $result | Where-Object { $_.PublicIPSKU -eq 'Basic' } | ft
-
-# Rows missing an address (dynamic/unallocated or prefix-backed)
-# $result | Where-Object { -not $_.PublicIPAddress -or $_.PublicIPAddress -eq 'Unallocated' -or $_.PublicIPAddress -like '[From Prefix:*' } | ft
-
-
-$pipId = "<full /subscriptions/.../publicIPAddresses/...>"
-az network public-ip show --ids $pipId --query "[ipAddress, properties.ipAddress, publicIPAllocationMethod, sku.name]" -o table
+# how i found the right place to parse for the publicip
+#$pipId = "<full /subscriptions/.../publicIPAddresses/...>"
+#az network public-ip show --ids $pipId --query "[ipAddress, properties.ipAddress, publicIPAllocationMethod, sku.name]" -o table
