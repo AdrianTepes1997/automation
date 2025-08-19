@@ -1,4 +1,4 @@
-# Draft
+# Final
 # variables list
 #$rgname = ""
 $subid = ""
