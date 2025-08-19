@@ -139,3 +139,7 @@ Write-Host "Saved: $outFile"
 
 # Rows missing an address (dynamic/unallocated or prefix-backed)
 # $result | Where-Object { -not $_.PublicIPAddress -or $_.PublicIPAddress -eq 'Unallocated' -or $_.PublicIPAddress -like '[From Prefix:*' } | ft
+
+
+$pipId = "<full /subscriptions/.../publicIPAddresses/...>"
+az network public-ip show --ids $pipId --query "[ipAddress, properties.ipAddress, publicIPAllocationMethod, sku.name]" -o table
