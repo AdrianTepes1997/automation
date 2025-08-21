@@ -4,13 +4,10 @@ $rgname = ""
 $subid = ""
 
 $appGwName  = "<APPGW_NAME>"
-$pipName     = "<PUBLIC_IP_NAME>"    # leave blank to auto-detect if only one PIP is attached
-$capacity    = 2                     # used if not autoscale
-$useAutoscale = $false               # $true to use autoscale instead of fixed capacity
-$minCap      = 2
-$maxCap      = 10
-$whatIf      = $false                # $true = preview only
-$confirm     = $true                 # $true = ask before running each step
+
+# Behavior flags
+$whatIf  = $false   # $true = preview only
+$confirm = $true    # $true = prompt before each change
 ################################################################################################################################
 az login
 az account set --subscription $subid
@@ -23,7 +20,7 @@ function Parse-PipId {
     if ($id) {
         $parts = $id.Trim('/').Split('/')
         for ($i=0; $i -lt $parts.Length; $i++) {
-            if ($parts[$i] -eq 'resourceGroups' -and ($i+1) -lt $parts.Length) { $rg = $parts[$i+1] }
+            if ($parts[$i] -eq 'resourceGroups'    -and ($i+1) -lt $parts.Length) { $rg   = $parts[$i+1] }
             if ($parts[$i] -eq 'publicIPAddresses' -and ($i+1) -lt $parts.Length) { $name = $parts[$i+1] }
         }
     }
@@ -39,73 +36,115 @@ function Should-Run($msg){
     return $true
 }
 
-# --- Auth ---
+# --- Auth / context ---
 az login
-az account set --subscription $subid
+az account set --subscription $subid | Out-Null
 
-# --- 1) Inspect AppGW ---
-$agRaw = az network application-gateway show -g $rgName -n $appGwName -o json | ConvertFrom-Json
-$agSkuName = Coalesce @($agRaw.properties.sku.name, $agRaw.sku.name)
-$agTier    = Coalesce @($agRaw.properties.sku.tier, $agRaw.sku.tier)
-$fips      = Coalesce @($agRaw.properties.frontendIPConfigurations, $agRaw.frontendIPConfigurations)
+# --- 1) Inspect AppGW + discover attached Public IP(s) ---
+$ag = az network application-gateway show -g $rgName -n $appGwName -o json | ConvertFrom-Json
+if (-not $ag) { throw "Application Gateway '$appGwName' not found in RG '$rgName'." }
+
+$agSkuName = Coalesce @($ag.properties.sku.name, $ag.sku.name)
+$agTier    = Coalesce @($ag.properties.sku.tier, $ag.sku.tier)
+$fips      = Coalesce @($ag.properties.frontendIPConfigurations, $ag.frontendIPConfigurations)
 
 Write-Host "Current AppGW SKU: $agSkuName (tier: $agTier)"
-if ($agSkuName -eq "Standard_v2" -or $agTier -eq "Standard_v2") {
-    Write-Host "Already Standard_v2 — no upgrade needed." -ForegroundColor Yellow
-    return
-}
 
-# --- 2) Find attached Public IP ---
+# Gather PIP IDs from all frontend IP configs
 $publicPipIds = @()
 if ($fips) {
-    foreach ($fip in $fips) {
-        $pipRef = Coalesce @($fip.properties.publicIPAddress, $fip.publicIPAddress)
+    foreach ($f in $fips) {
+        $pipRef = Coalesce @($f.properties.publicIPAddress, $f.publicIPAddress)
         if ($pipRef -and $pipRef.id) { $publicPipIds += $pipRef.id }
     }
 }
 $publicPipIds = $publicPipIds | Select-Object -Unique
 
-if (-not $pipName) {
-    if ($publicPipIds.Count -eq 0) { throw "No Public IP attached to this AppGW." }
-    if ($publicPipIds.Count -gt 1) { throw "Multiple PIPs found. Please set `$pipName manually." }
-    $parsed = Parse-PipId -id $publicPipIds[0]
-    $pipRg  = $parsed.ResourceGroup
-    $pipName= $parsed.Name
-} else {
-    $pipObj = az network public-ip show -g $rgName -n $pipName -o json 2>$null | ConvertFrom-Json
-    if ($pipObj) { $pipRg = $rgName } else {
-        $pipObj = az network public-ip list --query "[?name=='$pipName']" -o json | ConvertFrom-Json
-        if ($pipObj) { $pipRg = $pipObj[0].resourceGroup } else { throw "Could not find Public IP $pipName" }
-    }
+if ($publicPipIds.Count -eq 0) {
+    throw "No Public IP is attached to this Application Gateway."
 }
 
-# --- 3) Inspect Public IP ---
+# If multiple PIPs attached, prompt user to choose which to upgrade
+$pipRg = $null; $pipName = $null
+if ($publicPipIds.Count -eq 1) {
+    $parsed  = Parse-PipId -id $publicPipIds[0]
+    $pipRg   = $parsed.ResourceGroup
+    $pipName = $parsed.Name
+} else {
+    Write-Host "Multiple Public IPs are attached to this AppGW:`n"
+    for ($i=0; $i -lt $publicPipIds.Count; $i++) {
+        $p = Parse-PipId -id $publicPipIds[$i]
+        Write-Host ("[{0}] RG: {1}  Name: {2}" -f $i, $p.ResourceGroup, $p.Name)
+    }
+    $choice = Read-Host "Enter the index of the Public IP to upgrade (0 - $($publicPipIds.Count-1))"
+    if ($choice -notmatch '^\d+$' -or [int]$choice -ge $publicPipIds.Count) {
+        throw "Invalid choice."
+    }
+    $sel    = Parse-PipId -id $publicPipIds[[int]$choice]
+    $pipRg   = $sel.ResourceGroup
+    $pipName = $sel.Name
+}
+Write-Host "Selected Public IP: $pipName (RG: $pipRg)"
+
+# --- 2) Detect capacity/autoscale from current AppGW ---
+$capacityNode = Coalesce @($ag.properties.sku.capacity, $ag.sku.capacity)
+$autoNode     = Coalesce @($ag.properties.autoscaleConfiguration, $ag.autoscaleConfiguration)
+
+$useAutoscale = $false
+$capacity     = 2   # default if not present
+$minCap       = 2
+$maxCap       = 10
+
+if ($autoNode) {
+    $useAutoscale = $true
+    $minCap = Coalesce @($autoNode.minCapacity), 2
+    $maxCap = Coalesce @($autoNode.maxCapacity), 10
+} elseif ($capacityNode) {
+    $useAutoscale = $false
+    $capacity = [int]$capacityNode
+}
+
+Write-Host ("Discovered capacity mode: " + ($(if($useAutoscale){"Autoscale ($minCap-$maxCap)"} else {"Fixed capacity ($capacity)"})))
+
+# --- 3) Inspect the chosen Public IP ---
 $pip = az network public-ip show -g $pipRg -n $pipName -o json | ConvertFrom-Json
+if (-not $pip) { throw "Could not load Public IP '$pipName' in RG '$pipRg'." }
+
 $pipSku  = Coalesce @($pip.sku.name, $pip.properties.sku.name)
+$pipTier = Coalesce @($pip.sku.tier, $pip.properties.sku.tier)
 $alloc   = Coalesce @($pip.publicIPAllocationMethod, $pip.properties.publicIPAllocationMethod)
 $ipAddr  = Coalesce @($pip.ipAddress, $pip.properties.ipAddress)
 
-Write-Host "Attached PIP: $pipName (RG: $pipRg) — SKU: $pipSku, Allocation: $alloc, IP: $ipAddr"
+Write-Host "Public IP state — SKU: $pipSku, Tier: $pipTier, Allocation: $alloc, IP: $ipAddr"
 
-# --- 4) Update Public IP if needed ---
-if ($pipSku -eq "Basic" -or $alloc -ne "Static") {
-    if (Should-Run "Updating PIP '$pipName' to Standard/Static...") {
+# --- 4) Public IP upgrade (in place) ---
+$needsPipUpgrade   = ($pipSku -eq 'Basic')
+$needsAllocStatic  = ($alloc -ne 'Static')
+
+if ($needsPipUpgrade -or $needsAllocStatic) {
+    if (Should-Run "Updating Public IP '$pipName' to SKU=Standard, Allocation=Static (IP preserved)...") {
         az network public-ip update -g $pipRg -n $pipName --sku Standard --allocation-method Static
     }
 } else {
-    Write-Host "Public IP already Standard/Static."
+    Write-Host "Public IP already Standard/Static — no change needed."
 }
 
-# --- 5) Update AppGW SKU ---
-if ($useAutoscale) {
-    if (Should-Run "Upgrading AppGW '$appGwName' to Standard_v2 (autoscale $minCap-$maxCap)...") {
-        az network application-gateway update -g $rgName -n $appGwName `
-            --set sku.name=Standard_v2 sku.tier=Standard_v2 autoscaleConfiguration.minCapacity=$minCap autoscaleConfiguration.maxCapacity=$maxCap
-    }
+# --- 5) AppGW upgrade (disruptive) ---
+if ($agSkuName -eq 'Standard_v2' -or $agTier -eq 'Standard_v2') {
+    Write-Host "Application Gateway already Standard_v2 — no change needed."
 } else {
-    if (Should-Run "Upgrading AppGW '$appGwName' to Standard_v2 (capacity $capacity)...") {
-        az network application-gateway update -g $rgName -n $appGwName `
-            --set sku.name=Standard_v2 sku.tier=Standard_v2 sku.capacity=$capacity
+    if ($useAutoscale) {
+        if (Should-Run "Upgrading AppGW '$appGwName' to Standard_v2 with autoscale ($minCap-$maxCap)...") {
+            az network application-gateway update `
+              -g $rgName -n $appGwName `
+              --set sku.name=Standard_v2 sku.tier=Standard_v2 autoscaleConfiguration.minCapacity=$minCap autoscaleConfiguration.maxCapacity=$maxCap
+        }
+    } else {
+        if (Should-Run "Upgrading AppGW '$appGwName' to Standard_v2 with fixed capacity ($capacity)...") {
+            az network application-gateway update `
+              -g $rgName -n $appGwName `
+              --set sku.name=Standard_v2 sku.tier=Standard_v2 sku.capacity=$capacity
+        }
     }
 }
 
