@@ -40,59 +40,56 @@ function Should-Run($msg){
 az login
 az account set --subscription $subid | Out-Null
 
-# --- 1) Load AppGW and discover Public IP(s) ---
+# --- 1) Load AppGW + discover Public IP(s) ---
 $ag = az network application-gateway show -g $rgName -n $appGwName -o json | ConvertFrom-Json
 if (-not $ag) { throw "Application Gateway '$appGwName' not found in RG '$rgName'." }
 
-$agSkuName = Coalesce @($ag.properties.sku.name, $ag.sku.name)
-$agTier    = Coalesce @($ag.properties.sku.tier, $ag.sku.tier)
+$agSkuName = Coalesce @($ag.sku.name, $ag.properties.sku.name)
+$agTier    = Coalesce @($ag.sku.tier, $ag.properties.sku.tier)
 
-$fips = $ag.properties.frontendIPConfigurations
-if (-not $fips) { $fips = $ag.frontendIPConfigurations }
+# YOUR TENANT SHAPE: fips at top-level
+$fips = Coalesce @($ag.frontendIPConfigurations, $ag.properties.frontendIPConfigurations)
 
 Write-Host "Current AppGW SKU: $agSkuName (tier: $agTier)"
+if (-not $fips) { throw "No frontendIPConfigurations found on this AppGW." }
 
 $publicPipIds = @()
-if ($fips) {
-    foreach ($f in $fips) {
-        $pipId = $null
-        if ($f.properties -and $f.properties.publicIPAddress) { $pipId = $f.properties.publicIPAddress.id }
-        elseif ($f.publicIPAddress)                            { $pipId = $f.publicIPAddress.id }
-
-        if ($pipId) {
-            Write-Host "Discovered PIP reference on FrontendIP '$($f.name)': $pipId"
-            $publicPipIds += $pipId
-        } else {
-            Write-Host "FrontendIP '$($f.name)' has no Public IP reference (private-only)."
-        }
+foreach ($f in $fips) {
+    # YOUR TENANT SHAPE: PIP ref at f.publicIPAddress.id (fallback to properties.*)
+    $pipId = Coalesce @($f.publicIPAddress.id, $f.properties.publicIPAddress.id)
+    if ($pipId) {
+        Write-Host "Discovered PIP on FrontendIP '$($f.name)': $pipId"
+        $publicPipIds += $pipId
+    } else {
+        Write-Host "FrontendIP '$($f.name)' has no Public IP (private-only)."
     }
 }
 $publicPipIds = $publicPipIds | Select-Object -Unique
-if ($publicPipIds.Count -eq 0) { throw "No Public IP references found on this Application Gateway." }
+if ($publicPipIds.Count -eq 0) { throw "No Public IP references found on this AppGW." }
 
 # Pick one PIP (prompt if multiple)
 $pipRg = $null; $pipName = $null
 if ($publicPipIds.Count -eq 1) {
-    $parsed  = Parse-PipId -id $publicPipIds[0]
-    $pipRg   = $parsed.ResourceGroup
-    $pipName = $parsed.Name
+    $p = Parse-PipId -id $publicPipIds[0]
+    $pipRg   = $p.ResourceGroup
+    $pipName = $p.Name
 } else {
-    Write-Host "`nMultiple Public IPs are attached to this AppGW:"
+    Write-Host "`nMultiple Public IPs attached:"
     for ($i=0; $i -lt $publicPipIds.Count; $i++) {
         $p = Parse-PipId -id $publicPipIds[$i]
         Write-Host ("[{0}] RG: {1}  Name: {2}" -f $i, $p.ResourceGroup, $p.Name)
     }
     $choice = Read-Host "Enter the index of the Public IP to upgrade (0 - $($publicPipIds.Count-1))"
     if ($choice -notmatch '^\d+$' -or [int]$choice -ge $publicPipIds.Count) { throw "Invalid selection." }
-    $sel    = Parse-PipId -id $publicPipIds[[int]$choice]
+    $sel = Parse-PipId -id $publicPipIds[[int]$choice]
     $pipRg   = $sel.ResourceGroup
     $pipName = $sel.Name
 }
 Write-Host "Selected Public IP: $pipName (RG: $pipRg)"
 
 # --- 2) Detect capacity/autoscale from current AppGW ---
-$capacityNode = Coalesce @($ag.properties.sku.capacity, $ag.sku.capacity)
-$autoNode     = Coalesce @($ag.properties.autoscaleConfiguration, $ag.autoscaleConfiguration)
+$capacityNode = Coalesce @($ag.sku.capacity, $ag.properties.sku.capacity)
+$autoNode     = Coalesce @($ag.autoscaleConfiguration, $ag.properties.autoscaleConfiguration)
 
 $useAutoscale = $false
 $capacity     = 2
@@ -106,9 +103,9 @@ if ($autoNode) {
     $useAutoscale = $false
     $capacity = [int]$capacityNode
 }
-Write-Host ("Capacity mode discovered: " + ($(if($useAutoscale){"Autoscale ($minCap-$maxCap)"} else {"Fixed capacity ($capacity)"})))
+Write-Host ("Capacity mode: " + ($(if($useAutoscale){"Autoscale ($minCap-$maxCap)"} else {"Fixed capacity ($capacity)"})))
 
-# --- 3) Inspect Public IP state ---
+# --- 3) Inspect Public IP ---
 $pip = az network public-ip show -g $pipRg -n $pipName -o json | ConvertFrom-Json
 if (-not $pip) { throw "Could not load Public IP '$pipName' in RG '$pipRg'." }
 
@@ -117,7 +114,7 @@ $pipTier = Coalesce @($pip.sku.tier, $pip.properties.sku.tier)
 $alloc   = Coalesce @($pip.publicIPAllocationMethod, $pip.properties.publicIPAllocationMethod)
 $ipAddr  = Coalesce @($pip.ipAddress, $pip.properties.ipAddress)
 
-Write-Host "Public IP status: SKU=$pipSku, Tier=$pipTier, Allocation=$alloc, IP=$ipAddr"
+Write-Host "Public IP: SKU=$pipSku, Tier=$pipTier, Allocation=$alloc, IP=$ipAddr"
 
 # --- 4) Upgrade PIP (in-place) to Standard/Static if needed ---
 $needsPipUpgrade  = ($pipSku -eq 'Basic')
