@@ -4,8 +4,12 @@ $appGwName = "<APPGW_NAME>"
 
 az account set --subscription $subid | Out-Null
 
-# Get raw JSON
 $ag = az network application-gateway show -g $rgName -n $appGwName -o json | ConvertFrom-Json
 
-Write-Host "=== Dumping frontendIPConfigurations ==="
-$ag.properties.frontendIPConfigurations | ConvertTo-Json -Depth 10
+# Dump top-level keys
+Write-Host "=== Keys on AppGW object ==="
+$ag | Get-Member -MemberType NoteProperty
+
+# Dump full object (be careful, big!)
+$ag | ConvertTo-Json -Depth 20 | Out-File ".\AppGwDump.json" -Encoding utf8
+Write-Host "Wrote full dump to AppGwDump.json"
